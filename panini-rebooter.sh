@@ -8,6 +8,10 @@ DEBUG=false
 VERBOSE=false
 ACTION=""
 
+# Resolve absolute script path robustly (works with direct exec or via bash)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+
 # Parse command line arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -30,6 +34,34 @@ debug_log() {
 verbose_log() {
     if [ "$VERBOSE" = true ]; then
         echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    fi
+}
+
+# Ensure the script is running with superuser privileges.
+# If not, prompt to re-run with sudo and preserve DEBUG/VERBOSE env vars.
+ensure_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo "This script requires administrator privileges."
+        if [ -t 0 ]; then
+            read -r -p "Re-run with sudo now? [Y/n]: " response
+            response=${response:-Y}
+            case "$response" in
+                [Yy]*)
+                    echo "Re-running with sudo..."
+                    # Prompt for sudo upfront to fail fast if not allowed
+                    sudo -v || { echo "Failed to obtain sudo privileges."; exit 1; }
+                    exec sudo --preserve-env=DEBUG,VERBOSE "$SCRIPT_PATH" "$@"
+                    ;;
+                *)
+                    echo "Exiting. Please run this script with sudo."
+                    exit 1
+                    ;;
+            esac
+        else
+            echo "Non-interactive shell detected. Please run with sudo:"
+            echo "  sudo $SCRIPT_PATH $*"
+            exit 1
+        fi
     fi
 }
 
@@ -324,6 +356,9 @@ show_status() {
         check_mono_logs
     fi
 }
+
+# Enforce superuser privileges before proceeding
+ensure_root "$@"
 
 # Main execution
 echo "============================"
