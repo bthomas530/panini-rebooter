@@ -3,10 +3,28 @@
 # Script to manage Panini Everest Engine
 # Must be run with sudo privileges
 
+# Fail loudly if any command in a pipeline fails (e.g. curl | grep)
+set -o pipefail
+
 # Debug mode flag
 DEBUG=false
 VERBOSE=false
 ACTION=""
+
+# --- Configuration (single source of truth) -------------------------------
+PLIST="/Library/LaunchDaemons/com.panini.everestengine.plist"
+ENGINE_DIR="/usr/local/bin/everestengine"
+SERVICE_PORT=44343
+SERVICE_URL="https://localhost:${SERVICE_PORT}"
+PROCESS_PATTERN="everestengine"
+STARTUP_TIMEOUT=60   # seconds to wait for the service to come up
+SHUTDOWN_TIMEOUT=10  # seconds to wait for a graceful stop
+
+# launchd targeting (modern launchctl uses domain/service-target syntax)
+LAUNCHD_DOMAIN="system"
+DAEMON_LABEL="$(basename "$PLIST" .plist)"        # e.g. com.panini.everestengine
+SERVICE_TARGET="${LAUNCHD_DOMAIN}/${DAEMON_LABEL}"
+# --------------------------------------------------------------------------
 
 # Resolve absolute script path robustly (works with direct exec or via bash)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,32 +55,60 @@ verbose_log() {
     fi
 }
 
-# Ensure the script is running with superuser privileges.
-# If not, prompt to re-run with sudo and preserve DEBUG/VERBOSE env vars.
-ensure_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo "This script requires administrator privileges."
-        if [ -t 0 ]; then
-            read -r -p "Re-run with sudo now? [Y/n]: " response
-            response=${response:-Y}
-            case "$response" in
-                [Yy]*)
-                    echo "Re-running with sudo..."
-                    # Prompt for sudo upfront to fail fast if not allowed
-                    sudo -v || { echo "Failed to obtain sudo privileges."; exit 1; }
-                    exec sudo --preserve-env=DEBUG,VERBOSE "$SCRIPT_PATH" "$@"
-                    ;;
-                *)
-                    echo "Exiting. Please run this script with sudo."
-                    exit 1
-                    ;;
-            esac
-        else
-            echo "Non-interactive shell detected. Please run with sudo:"
-            echo "  sudo $SCRIPT_PATH $*"
-            exit 1
-        fi
+# Escalate to root for a specific action that needs it (start/stop/restart).
+# We re-exec sudo with the already-resolved action so the privileged run goes
+# straight to work instead of re-showing the menu. Read-only checks (status,
+# health probes) never trigger this — only an actual fix prompts for a password.
+escalate_if_needed() {
+    local action="$1"
+    [ "$EUID" -eq 0 ] && return 0
+
+    echo "Administrator privileges are required to ${action} the service."
+    if [ ! -t 0 ]; then
+        echo "Non-interactive shell detected. Re-run with:"
+        echo "  sudo $SCRIPT_PATH $action"
+        exit 1
     fi
+
+    echo "Re-running with sudo..."
+    sudo -v || { echo "Failed to obtain sudo privileges."; exit 1; }
+
+    # Forward the debug/verbose flags so the privileged run behaves the same.
+    local extra=""
+    [ "$DEBUG" = true ] && extra="$extra --debug"
+    [ "$VERBOSE" = true ] && extra="$extra --verbose"
+    # shellcheck disable=SC2086  # intentional word-splitting of known-safe flags
+    exec sudo "$SCRIPT_PATH" "$action" $extra
+}
+
+# --- Modern launchctl wrappers --------------------------------------------
+# macOS deprecated `launchctl load/unload` in favor of bootstrap/bootout/
+# kickstart against a domain target (e.g. system/com.panini.everestengine).
+# Each wrapper falls back to the legacy verb so the script still works on
+# older systems. All of these require root.
+
+# Load the daemon (bootstrap), falling back to legacy load.
+daemon_bootstrap() {
+    launchctl bootstrap "$LAUNCHD_DOMAIN" "$PLIST" 2>/dev/null \
+        || launchctl load "$PLIST"
+}
+
+# Unload the daemon (bootout), falling back to legacy unload.
+daemon_bootout() {
+    launchctl bootout "$SERVICE_TARGET" 2>/dev/null \
+        || launchctl bootout "$LAUNCHD_DOMAIN" "$PLIST" 2>/dev/null \
+        || launchctl unload "$PLIST" 2>/dev/null
+}
+
+# Kill and immediately restart the running service in one step.
+daemon_kickstart() {
+    launchctl kickstart -k "$SERVICE_TARGET"
+}
+
+# Return success if the daemon is currently bootstrapped into launchd.
+# (Reading the system domain requires root.)
+daemon_is_loaded() {
+    launchctl print "$SERVICE_TARGET" >/dev/null 2>&1
 }
 
 # Function to check if a command succeeded
@@ -77,15 +123,16 @@ check_status() {
     fi
 }
 
-# Function to check if the service is responding
+# Function to check if the service is responding.
+# Quiet by design (returns status only) so it can be polled cheaply; callers
+# print human-readable output. Optional arg overrides the request timeout.
 check_service() {
-    debug_log "Attempting to connect to https://localhost:44343"
-    if curl -s -k --connect-timeout 10 --max-time 15 https://localhost:44343 > /dev/null 2>&1; then
-        echo "✓ Service is responding"
+    local max_time=${1:-6}
+    debug_log "Probing ${SERVICE_URL} (max-time ${max_time}s)"
+    if curl -s -k --connect-timeout 3 --max-time "$max_time" "$SERVICE_URL" > /dev/null 2>&1; then
         debug_log "Service check successful"
         return 0
     else
-        echo "✗ Service is not responding"
         debug_log "Service check failed"
         return 1
     fi
@@ -118,7 +165,7 @@ check_mono() {
 
 # Function to check Mono process logs
 check_mono_logs() {
-    local pid=$(pgrep -f "everestengine")
+    local pid=$(pgrep -f "$PROCESS_PATTERN")
     if [ -n "$pid" ]; then
         echo "Checking Mono process logs for PID $pid..."
         lsof -p $pid 2>/dev/null
@@ -129,17 +176,22 @@ check_mono_logs() {
 # Function to wait for service with timeout
 wait_for_service() {
     local timeout=$1
-    local interval=5
+    local interval=2
     local elapsed=0
-    
+
     echo "Waiting for service to start (timeout: ${timeout}s)..."
     while [ $elapsed -lt $timeout ]; do
-        if check_service; then
+        # Use a short probe timeout while polling: the engine binds the port
+        # before it can answer, so a long timeout would stall each iteration.
+        if check_service 4; then
+            echo "✓ Service is responding (after ${elapsed}s)"
             return 0
         fi
         sleep $interval
         elapsed=$((elapsed + interval))
-        echo "Still waiting... (${elapsed}s elapsed)"
+        if [ $((elapsed % 6)) -eq 0 ]; then
+            echo "Still waiting... (${elapsed}s elapsed)"
+        fi
         if [ "$DEBUG" = true ]; then
             check_mono_logs
         fi
@@ -150,9 +202,16 @@ wait_for_service() {
 # Function to start the service
 start_service() {
     echo "Starting Panini Everest Engine..."
-    
+
+    # The LaunchDaemon plist must exist or launchctl load is a silent no-op
+    if [ ! -f "$PLIST" ]; then
+        echo "✗ LaunchDaemon not found: $PLIST"
+        echo "  The Panini Everest Engine may not be installed correctly."
+        return 1
+    fi
+
     # Check if already running and responding
-    if check_process "everestengine"; then
+    if check_process "$PROCESS_PATTERN"; then
         echo "Process is already running, checking service response..."
         if check_service; then
             echo "✓ Service is already running and responding correctly."
@@ -164,20 +223,22 @@ start_service() {
             sleep 2
         fi
     fi
-    
-    # Ensure LaunchDaemon is unloaded first (clean slate)
-    debug_log "Ensuring clean state by unloading LaunchDaemon first"
-    launchctl unload /Library/LaunchDaemons/com.panini.everestengine.plist 2>/dev/null
-    sleep 2
-    
-    # Start the service
-    echo "Loading Panini LaunchDaemon..."
-    debug_log "Attempting to load: /Library/LaunchDaemons/com.panini.everestengine.plist"
-    launchctl load /Library/LaunchDaemons/com.panini.everestengine.plist
+
+    # Bring the daemon up. If it's already bootstrapped, kickstart it (kill +
+    # restart) rather than bootstrap again (which would error "already loaded").
+    if daemon_is_loaded; then
+        echo "Daemon already loaded; kickstarting it..."
+        debug_log "kickstart -k $SERVICE_TARGET"
+        daemon_kickstart
+    else
+        echo "Bootstrapping Panini LaunchDaemon..."
+        debug_log "bootstrap $LAUNCHD_DOMAIN $PLIST"
+        daemon_bootstrap
+    fi
     check_status "Started Panini services"
-    
+
     # Wait for service to start
-    if wait_for_service 60; then
+    if wait_for_service "$STARTUP_TIMEOUT"; then
         echo "✓ Panini Everest Engine started successfully!"
         return 0
     else
@@ -193,21 +254,21 @@ stop_service() {
     echo "Stopping Panini Everest Engine..."
     
     # Check if running
-    if ! check_process "everestengine"; then
+    if ! check_process "$PROCESS_PATTERN"; then
         echo "Service is not running."
         return 0
     fi
-    
+
     # Stop the service via launchctl first
-    debug_log "Attempting to unload: /Library/LaunchDaemons/com.panini.everestengine.plist"
-    launchctl unload /Library/LaunchDaemons/com.panini.everestengine.plist 2>/dev/null
+    debug_log "bootout $SERVICE_TARGET"
+    daemon_bootout
     check_status "Stopped Panini services"
-    
+
     # Wait briefly for graceful shutdown
-    local timeout=10
+    local timeout=$SHUTDOWN_TIMEOUT
     local elapsed=0
     while [ $elapsed -lt $timeout ]; do
-        if ! check_process "everestengine"; then
+        if ! check_process "$PROCESS_PATTERN"; then
             echo "✓ Service stopped gracefully"
             return 0
         fi
@@ -225,13 +286,13 @@ stop_service() {
     local killed_any=false
     
     # Kill everestengine processes
-    local pids=$(pgrep -f "everestengine")
+    local pids=$(pgrep -f "$PROCESS_PATTERN")
     if [ -n "$pids" ]; then
         echo "Force killing everestengine processes: $pids"
         kill -9 $pids 2>/dev/null
         killed_any=true
     fi
-    
+
     # Kill any mono processes running Panini executables
     local mono_pids=$(pgrep -f "mono.*Panini")
     if [ -n "$mono_pids" ]; then
@@ -239,29 +300,29 @@ stop_service() {
         kill -9 $mono_pids 2>/dev/null
         killed_any=true
     fi
-    
+
     # Kill any processes using the Panini directory
-    local panini_pids=$(lsof +D /usr/local/bin/everestengine 2>/dev/null | awk 'NR>1 {print $2}' | sort -u)
+    local panini_pids=$(lsof +D "$ENGINE_DIR" 2>/dev/null | awk 'NR>1 {print $2}' | sort -u)
     if [ -n "$panini_pids" ]; then
         echo "Force killing processes using Panini directory: $panini_pids"
         kill -9 $panini_pids 2>/dev/null
         killed_any=true
     fi
-    
-    # Kill any processes listening on port 44343
-    local port_pids=$(lsof -ti:44343 2>/dev/null)
+
+    # Kill any processes listening on the service port
+    local port_pids=$(lsof -ti:"$SERVICE_PORT" 2>/dev/null)
     if [ -n "$port_pids" ]; then
-        echo "Force killing processes on port 44343: $port_pids"
+        echo "Force killing processes on port $SERVICE_PORT: $port_pids"
         kill -9 $port_pids 2>/dev/null
         killed_any=true
     fi
-    
+
     if [ "$killed_any" = true ]; then
         sleep 3  # Give time for processes to die
     fi
-    
+
     # Final check
-    if ! check_process "everestengine"; then
+    if ! check_process "$PROCESS_PATTERN"; then
         echo "✓ All Panini processes stopped"
         return 0
     else
@@ -276,15 +337,29 @@ stop_service() {
 # Function to restart the service
 restart_service() {
     echo "Restarting Panini Everest Engine..."
-    
-    # Stop first
+
+    if [ ! -f "$PLIST" ]; then
+        echo "✗ LaunchDaemon not found: $PLIST"
+        echo "  The Panini Everest Engine may not be installed correctly."
+        return 1
+    fi
+
+    # Fast path: if the daemon is loaded, kickstart -k kills and relaunches it
+    # in a single launchd call — no unload/sleep/load dance.
+    if daemon_is_loaded; then
+        echo "Kickstarting service (kill + relaunch)..."
+        debug_log "kickstart -k $SERVICE_TARGET"
+        if daemon_kickstart && wait_for_service "$STARTUP_TIMEOUT"; then
+            echo "✓ Panini Everest Engine restarted successfully!"
+            return 0
+        fi
+        echo "Kickstart did not bring the service up; falling back to full stop/start..."
+    fi
+
+    # Fallback: full stop (with force-kill) then start.
     stop_service
-    
-    # Wait a moment for the system to settle
     debug_log "Waiting for system to settle..."
-    sleep 5
-    
-    # Start again
+    sleep 3
     start_service
 }
 
@@ -326,12 +401,12 @@ show_status() {
     
     # Check process status
     echo -n "Process Status: "
-    if check_process "everestengine"; then
+    if check_process "$PROCESS_PATTERN"; then
         echo "✓ Running"
     else
         echo "✗ Not Running"
     fi
-    
+
     # Check service status
     echo -n "Service Status: "
     if check_service; then
@@ -340,41 +415,64 @@ show_status() {
         echo "✗ Not Responding"
     fi
     
-    # Show LaunchDaemon status
+    # Show LaunchDaemon status. Querying the system domain needs root, so when
+    # unprivileged we say so rather than reporting a misleading "Not Loaded".
     echo -n "LaunchDaemon Status: "
-    local daemon_status=$(launchctl list | grep panini)
-    if [ -n "$daemon_status" ]; then
-        echo "✓ Loaded"
-        echo "  $daemon_status"
+    if [ "$EUID" -ne 0 ]; then
+        echo "? (run with sudo to query the system domain)"
+    elif daemon_is_loaded; then
+        echo "✓ Loaded ($SERVICE_TARGET)"
     else
         echo "✗ Not Loaded"
     fi
     
     # Show process details if running and in debug mode
-    if [ "$DEBUG" = true ] && check_process "everestengine"; then
+    if [ "$DEBUG" = true ] && check_process "$PROCESS_PATTERN"; then
         echo -e "\nProcess Details:"
         check_mono_logs
     fi
 }
 
-# Enforce superuser privileges before proceeding
-ensure_root "$@"
-
 # Main execution
-echo "============================"
-echo "Panini Everest Engine Manager"
 debug_log "Script started with DEBUG=$DEBUG, VERBOSE=$VERBOSE, ACTION=$ACTION"
 
-# Check if Mono is installed
+# Mono is a hard prerequisite; check it up front (no privileges needed).
 if ! check_mono; then
     echo "Error: Mono is not installed. Please install Mono first."
     exit 1
 fi
 
-# If no action specified, show menu
+# No explicit action: diagnose first (read-only, no sudo), then act.
+# If the service is unhealthy we offer to restart immediately and only then
+# escalate to sudo — so the password prompt appears exactly when a fix is needed.
 if [ -z "$ACTION" ]; then
-    show_menu
+    echo "============================="
+    echo "Panini Everest Engine Manager"
+    echo "============================="
+    echo "Checking current status..."
+    echo ""
+    show_status
+    echo ""
+
+    if check_process "$PROCESS_PATTERN" && check_service; then
+        echo "✓ Panini is up and responding."
+        show_menu
+    else
+        echo "⚠ Panini is not running/responding."
+        read -r -p "Restart the service now? [Y/n]: " resp
+        resp=${resp:-Y}
+        case "$resp" in
+            [Yy]*) ACTION="restart" ;;
+            *)     show_menu ;;
+        esac
+    fi
 fi
+
+# Mutating actions need root; escalate now, carrying the resolved action across
+# the sudo boundary. Status is read-only and never prompts for a password.
+case $ACTION in
+    start|stop|restart) escalate_if_needed "$ACTION" ;;
+esac
 
 # Execute the requested action
 case $ACTION in
